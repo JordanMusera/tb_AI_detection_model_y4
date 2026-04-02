@@ -1,56 +1,53 @@
 import os
 import sys
 import base64
+import gc
 from io import BytesIO
 from PIL import Image, ImageFile
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
 
-# --- 1. SOLVE PATHING & IMPORTS ---
-# Get the absolute path of 'cnn_model' folder
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Get the absolute path of the Root ('tb_AI_detection_model_y4')
-ROOT_DIR = os.path.dirname(BASE_DIR)
-
-# Add Root to sys.path so Python can find the 'utils1' folder
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
-
-# Import the heatmap utility from your utils1 folder
-try:
-    from utils1.heatmap import generate_heatmap
-except ImportError:
-    print("Warning: utils1.heatmap not found. Heatmaps will be disabled.")
-    def generate_heatmap(*args, **kwargs): return None
-
 # Handle truncated images (common in some medical datasets)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# --- 1. PATHING & IMPORTS ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    # Since heatmap.py is now in the same 'cnn_model' folder
+    from .heatmap import generate_heatmap
+    print("SUCCESS: Heatmap module loaded.")
+except ImportError as e:
+    print(f"WARNING: Heatmap module not found ({e}). Visuals disabled.")
+    def generate_heatmap(*args, **kwargs): return None
+
 # --- 2. MODEL CONFIGURATION ---
-# Points directly to the file in the same folder as this script
 PTH_PATH = os.path.join(BASE_DIR, "tb_classifier.pth")
 
 def load_model():
-    """Initializes ResNet18 and loads trained weights."""
+    """Initializes ResNet18 and loads trained weights efficiently."""
     model = models.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, 2)
 
     if not os.path.exists(PTH_PATH):
         print(f"CRITICAL ERROR: Weight file missing at {PTH_PATH}")
-        # List files for debugging in Render logs
-        print(f"Files in {BASE_DIR}: {os.listdir(BASE_DIR)}")
         return None
 
-    # Load to CPU for Render's stability
-    model.load_state_dict(torch.load(PTH_PATH, map_location=torch.device('cpu')))
+    # Load to CPU and immediately set to eval mode
+    checkpoint = torch.load(PTH_PATH, map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint)
     model.eval()
+
+    # Clean up memory immediately after loading
+    del checkpoint
+    gc.collect()
     return model
 
-# Global model instance for efficiency (loads once on startup)
+# Global model instance
 model = load_model()
 
-# Image Preprocessing (Must match your training script exactly)
+# Image Preprocessing
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -64,34 +61,48 @@ class_names = ["Normal", "Tuberculosis"]
 
 # --- 3. THE HANDLER FUNCTION ---
 def handler(base64_image: str):
-    """Main function called by api.py to process images."""
+    """Processes image and returns prediction + visual heatmap."""
     try:
-        if not base64_image:
-            return {"status": "error", "message": "Empty image string."}
+        # Clear memory before starting heavy AI work
+        gc.collect()
 
-        # Handle Base64 Data URL prefix (e.g., 'data:image/png;base64,')
+        if not base64_image:
+            return {"status": "error", "message": "Empty image string received."}
+
+        # Handle Base64 Data URL prefix
         if "," in base64_image:
             base64_image = base64_image.split(",")[1]
 
-        # Decode and Process Image
+        # Decode Image
         image_bytes = base64.b64decode(base64_image)
         original_image = Image.open(BytesIO(image_bytes)).convert("RGB")
         img_tensor = transform(original_image).unsqueeze(0)
 
         if model is None:
-            return {"status": "error", "message": "Model not loaded on server."}
+            return {"status": "error", "message": "Model weights failed to load on server."}
 
-        # Run Prediction
-        with torch.no_grad():
-            outputs = model(img_tensor)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            pred_idx = outputs.argmax(1).item()
+        # --- Prediction Logic ---
+        # Note: We do NOT use 'with torch.no_grad()' here because
+        # generate_heatmap needs gradients to trace the decision.
+        outputs = model(img_tensor)
+        probabilities = torch.nn.functional.softmax(outputs, dim=1)
 
-            prediction = class_names[pred_idx]
-            confidence = probabilities[0][pred_idx].item()
+        # Get Confidence and Index
+        prob_values, indices = torch.max(probabilities, 1)
+        pred_idx = indices.item()
+        confidence = prob_values.item()
 
-        # Generate Visual Heatmap (Grad-CAM)
-        heatmap_base64 = generate_heatmap(model, img_tensor, original_image, pred_idx)
+        prediction = class_names[pred_idx]
+
+        # --- Heatmap Generation ---
+        heatmap_base64 = None
+        try:
+            # Only run if heatmap module exists
+            if generate_heatmap.__name__ != 'NoneType':
+                heatmap_base64 = generate_heatmap(model, img_tensor, original_image, pred_idx)
+        except Exception as heatmap_err:
+            print(f"HEATMAP FAILED: {str(heatmap_err)}")
+            # We don't crash the whole request if only the heatmap fails
 
         return {
             "status": "success",
@@ -102,4 +113,4 @@ def handler(base64_image: str):
 
     except Exception as e:
         print(f"HANDLER ERROR: {str(e)}")
-        return {"status": "error", "message": f"Server processing failed: {str(e)}"}
+        return {"status": "error", "message": f"Processing failed: {str(e)}"}
