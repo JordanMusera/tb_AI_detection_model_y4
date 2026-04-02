@@ -7,3 +7,4 @@ numpy
 Pillow
 python-multipart
 scipy
+pytorch-grad-cam
